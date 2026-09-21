@@ -37,3 +37,7 @@ It refreshes every 10 minutes.
 If the screen stays blank, try the SSD1309 display line in `src/main.cpp` instead of
 SSD1306, or change the I2C address from 0x3C to 0x3D. See `NEXT_STEPS.md` for more
 troubleshooting.
+
+## Credits
+
+Built with [Claude Code](https://claude.com/claude-code), Anthropic's AI coding assistant, as a first ESP32 hardware project.

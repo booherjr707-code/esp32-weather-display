@@ -1,7 +1,9 @@
 // ESP32-WROOM weather display
 // Board:   ESP32 Dev Module (ESP32-WROOM-32)
 // Display: 1.98" 128x64 OLED (SSD1309 / SSD1306), I2C
-// Weather: Open-Meteo (free, no API key) for Jonesboro, AR
+// Weather: National Weather Service (api.weather.gov), free, no API key,
+//          for Jonesboro, AR. Also polls for active severe weather alerts
+//          (watches/warnings) and flashes them across the top of the screen.
 //
 // Libraries (installed automatically by PlatformIO, see platformio.ini):
 //   - U8g2 by olikraus
@@ -25,10 +27,22 @@ const char* CITY_NAME = "JONESBORO, AR";
 const float LATITUDE  = 35.8423;
 const float LONGITUDE = -90.7043;
 
-const uint32_t REFRESH_MS = 10UL * 60UL * 1000UL;  // update every 10 minutes
+// National Weather Service identifiers for the coordinates above. These were
+// looked up once from https://api.weather.gov/points/{lat},{lon} and are
+// hardcoded here so the device doesn't need an extra lookup call on every
+// boot. If you change LATITUDE/LONGITUDE, look these up again the same way.
+const char* NWS_USER_AGENT = "esp32-weather-display (github.com/booherjr707-code/esp32-weather-display)";
+const char* NWS_GRID_ID = "MEG";
+const int   NWS_GRID_X  = 17;
+const int   NWS_GRID_Y  = 97;
+const char* NWS_STATION = "KJBR";  // Jonesboro Municipal Airport
+
+const uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;  // conditions + forecast
+const uint32_t ALERT_REFRESH_MS   = 2UL  * 60UL * 1000UL;  // severe weather alerts, checked more often
 const uint32_t WIFI_TIMEOUT_MS = 20000;
 
 // The top line rotates between the city name and the next three days' forecast.
+// While a severe alert is active, this is replaced by a flashing alert banner.
 const uint32_t HEADER_SLOT_SECS = 3;  // seconds each item stays up
 
 // US Central time, switches to daylight saving automatically.
@@ -45,36 +59,40 @@ const uint8_t OLED_I2C_ADDR = 0x3C;
 
 struct Weather {
   bool  valid = false;
-  float temp = 0, feelsLike = 0, wind = 0, high = 0, low = 0;
+  float temp = 0, feelsLike = 0, wind = 0;
+  int   high = 0, low = 0;
   int   humidity = 0;
-  int   code = 0;
+  char  condition[24] = "";  // from the live station observation, e.g. "Partly Cloudy"
 };
 
 struct ForecastDay {
   char name[8] = "";
-  int  code = 0;
+  char cond[20] = "";
   int  high = 0, low = 0;
+};
+
+struct Alert {
+  bool active = false;
+  int  severityRank = 0;   // 0 none, 1 unknown/minor .. 5 extreme
+  char event[36] = "";     // e.g. "Severe Thunderstorm Warning"
 };
 
 Weather weather;
 ForecastDay forecast[3];
+Alert alert;
 bool forecastValid = false;
 bool lastFetchFailed = false;
+bool lastAlertFetchFailed = false;
 uint32_t lastFetch = 0;
+uint32_t lastAlertFetch = 0;
 
-const char* describeCode(int code) {
-  if (code == 0)  return "Clear";
-  if (code == 1)  return "Mst clear";
-  if (code == 2)  return "Pt cloudy";
-  if (code == 3)  return "Overcast";
-  if (code == 45 || code == 48) return "Fog";
-  if (code >= 51 && code <= 57) return "Drizzle";
-  if (code >= 61 && code <= 67) return "Rain";
-  if (code >= 71 && code <= 77) return "Snow";
-  if (code >= 80 && code <= 82) return "Showers";
-  if (code == 85 || code == 86) return "Flurries";
-  if (code >= 95)               return "Storms";
-  return "Unknown";
+// Higher = more urgent. Anything present (even "Unknown") is worth flagging.
+int severityRank(const char* sev) {
+  if (strcmp(sev, "Extreme")  == 0) return 5;
+  if (strcmp(sev, "Severe")   == 0) return 4;
+  if (strcmp(sev, "Moderate") == 0) return 3;
+  if (strcmp(sev, "Minor")    == 0) return 2;
+  return 1;
 }
 
 // Phone-style signal bars (0-4) from the Wi-Fi RSSI in dBm.
@@ -124,17 +142,13 @@ bool connectWiFi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-bool fetchWeather() {
+// Fetches live current conditions from the nearest NWS observation station.
+// NWS reports temperature/wind/humidity in metric regardless of locale, so
+// we convert to F/mph here.
+bool fetchConditions() {
   if (!connectWiFi()) return false;
 
-  String url = String("https://api.open-meteo.com/v1/forecast")
-             + "?latitude=" + String(LATITUDE, 4)
-             + "&longitude=" + String(LONGITUDE, 4)
-             + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-               "weather_code,wind_speed_10m"
-             + "&daily=weather_code,temperature_2m_max,temperature_2m_min"
-             + "&temperature_unit=fahrenheit&wind_speed_unit=mph"
-             + "&timezone=America%2FChicago&forecast_days=4";
+  String url = String("https://api.weather.gov/stations/") + NWS_STATION + "/observations/latest";
 
   WiFiClientSecure client;
   client.setInsecure();  // skips certificate check; fine for public weather data
@@ -143,10 +157,11 @@ bool fetchWeather() {
   http.setTimeout(10000);
   http.useHTTP10(true);  // avoid chunked encoding, which breaks streaming JSON parsing
   if (!http.begin(client, url)) return false;
+  http.addHeader("User-Agent", NWS_USER_AGENT);  // api.weather.gov asks every client to identify itself
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
-    Serial.printf("HTTP error: %d\n", status);
+    Serial.printf("Conditions HTTP error: %d\n", status);
     http.end();
     return false;
   }
@@ -155,50 +170,184 @@ bool fetchWeather() {
   DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   if (err) {
-    Serial.printf("JSON error: %s\n", err.c_str());
+    Serial.printf("Conditions JSON error: %s\n", err.c_str());
     return false;
   }
 
-  JsonObject cur = doc["current"];
-  weather.temp      = cur["temperature_2m"] | 0.0f;
-  weather.feelsLike = cur["apparent_temperature"] | 0.0f;
-  weather.humidity  = cur["relative_humidity_2m"] | 0;
-  weather.wind      = cur["wind_speed_10m"] | 0.0f;
-  weather.code      = cur["weather_code"] | 0;
-  weather.high      = doc["daily"]["temperature_2m_max"][0] | 0.0f;
-  weather.low       = doc["daily"]["temperature_2m_min"][0] | 0.0f;
-  weather.valid     = true;
+  JsonObject p = doc["properties"];
+  float tempC = p["temperature"]["value"] | NAN;
+  if (isnan(tempC)) return false;  // station has no current reading yet
 
-  // Next 3 days (today is index 0 and is already on screen). Day names come
-  // from the dates ("2026-09-22" -> "Tue").
-  JsonObject daily = doc["daily"];
-  for (int i = 0; i < 3; i++) {
-    ForecastDay& d = forecast[i];
-    int idx = i + 1;
-    const char* date = daily["time"][idx] | "";
-    struct tm t = {};
-    int y, m, day;
-    if (sscanf(date, "%d-%d-%d", &y, &m, &day) == 3) {
-      t.tm_year = y - 1900;
-      t.tm_mon  = m - 1;
-      t.tm_mday = day;
-      t.tm_hour = 12;
-      mktime(&t);  // fills in the weekday
-      strftime(d.name, sizeof(d.name), "%a", &t);
-    } else {
-      strlcpy(d.name, "---", sizeof(d.name));
+  float feelsC = p["heatIndex"]["value"] | NAN;
+  if (isnan(feelsC)) feelsC = p["windChill"]["value"] | NAN;
+  if (isnan(feelsC)) feelsC = tempC;
+
+  float windKmh   = p["windSpeed"]["value"] | 0.0f;
+  float humidity  = p["relativeHumidity"]["value"] | 0.0f;
+  const char* desc = p["textDescription"] | "Unknown";
+
+  weather.temp      = tempC * 9.0f / 5.0f + 32.0f;
+  weather.feelsLike = feelsC * 9.0f / 5.0f + 32.0f;
+  weather.humidity  = (int)roundf(humidity);
+  weather.wind      = windKmh * 0.621371f;
+  strlcpy(weather.condition, desc, sizeof(weather.condition));
+  weather.valid = true;
+
+  Serial.printf("%.0fF, %s\n", weather.temp, weather.condition);
+  return true;
+}
+
+// Fetches today's high/low plus the next 3 days from the NWS gridpoint
+// forecast. Each day has a daytime and nighttime period; we pair them up by
+// date to get one high/low/condition per day.
+bool fetchForecast() {
+  if (!connectWiFi()) return false;
+
+  String url = String("https://api.weather.gov/gridpoints/") + NWS_GRID_ID + "/" +
+               NWS_GRID_X + "," + NWS_GRID_Y + "/forecast";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.useHTTP10(true);
+  if (!http.begin(client, url)) return false;
+  http.addHeader("User-Agent", NWS_USER_AGENT);
+
+  int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Forecast HTTP error: %d\n", status);
+    http.end();
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    Serial.printf("Forecast JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonArray periods = doc["properties"]["periods"];
+
+  bool gotHigh = false, gotLow = false;
+  int dayCount = -1;         // -1 before first period; 0 = today; 1..3 = the header days
+  char lastDate[11] = "";
+
+  for (JsonObject p : periods) {
+    const char* start = p["startTime"] | "";
+    char date[11] = "";
+    strncpy(date, start, 10);
+    date[10] = 0;
+    bool isDay   = p["isDaytime"] | false;
+    int  temp    = p["temperature"] | 0;
+    const char* cond = p["shortForecast"] | "";
+
+    // Today's high is the first daytime reading we see; tonight's low is the
+    // first nighttime reading, regardless of which "day" they fall under.
+    if (!gotHigh && isDay)  { weather.high = temp; gotHigh = true; }
+    if (!gotLow  && !isDay) { weather.low  = temp; gotLow  = true; }
+
+    if (strcmp(date, lastDate) != 0) {
+      dayCount++;
+      strlcpy(lastDate, date, sizeof(lastDate));
+      if (dayCount > 3) break;
+      if (dayCount >= 1) {
+        ForecastDay& d = forecast[dayCount - 1];
+        d.high = 0;
+        d.low  = 0;
+        d.cond[0] = 0;
+        struct tm t = {};
+        int y, m, day;
+        if (sscanf(date, "%d-%d-%d", &y, &m, &day) == 3) {
+          t.tm_year = y - 1900;
+          t.tm_mon  = m - 1;
+          t.tm_mday = day;
+          t.tm_hour = 12;
+          mktime(&t);  // fills in the weekday
+          strftime(d.name, sizeof(d.name), "%a", &t);
+        } else {
+          strlcpy(d.name, "---", sizeof(d.name));
+        }
+      }
     }
-    d.code = daily["weather_code"][idx] | 0;
-    d.high = (int)roundf(daily["temperature_2m_max"][idx] | 0.0f);
-    d.low  = (int)roundf(daily["temperature_2m_min"][idx] | 0.0f);
-  }
-  forecastValid = !daily["time"][3].isNull();
-  for (int i = 0; i < 3 && forecastValid; i++) {
-    Serial.printf("  %s %d/%d %s\n", forecast[i].name, forecast[i].high, forecast[i].low,
-                  describeCode(forecast[i].code));
+
+    if (dayCount >= 1 && dayCount <= 3) {
+      ForecastDay& d = forecast[dayCount - 1];
+      if (isDay) {
+        d.high = temp;
+        strlcpy(d.cond, cond, sizeof(d.cond));
+      } else {
+        d.low = temp;
+        if (!d.cond[0]) strlcpy(d.cond, cond, sizeof(d.cond));
+      }
+    }
   }
 
-  Serial.printf("%.0fF, %s\n", weather.temp, describeCode(weather.code));
+  forecastValid = (dayCount >= 3);
+  for (int i = 0; i < 3 && forecastValid; i++) {
+    Serial.printf("  %s %d/%d %s\n", forecast[i].name, forecast[i].high, forecast[i].low, forecast[i].cond);
+  }
+
+  return true;
+}
+
+// Fetches active NWS alerts (watches/warnings/advisories) for this point and
+// keeps the most urgent one. An empty result means no active alerts.
+bool fetchAlerts() {
+  if (!connectWiFi()) return false;
+
+  String url = String("https://api.weather.gov/alerts/active?point=") +
+               String(LATITUDE, 4) + "," + String(LONGITUDE, 4);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.useHTTP10(true);
+  if (!http.begin(client, url)) return false;
+  http.addHeader("User-Agent", NWS_USER_AGENT);
+
+  int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Alert HTTP error: %d\n", status);
+    http.end();
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    Serial.printf("Alert JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonArray features = doc["features"];
+  int bestRank = 0;
+  const char* bestEvent = "Alert";
+  for (JsonObject f : features) {
+    JsonObject p = f["properties"];
+    int rank = severityRank(p["severity"] | "Unknown");
+    if (rank > bestRank) {
+      bestRank = rank;
+      bestEvent = p["event"] | "Alert";
+    }
+  }
+
+  bool wasActive = alert.active;
+  alert.active = bestRank > 0;
+  alert.severityRank = bestRank;
+  if (alert.active) {
+    strlcpy(alert.event, bestEvent, sizeof(alert.event));
+    if (!wasActive) Serial.printf("ALERT: %s\n", alert.event);
+  } else {
+    alert.event[0] = 0;
+    if (wasActive) Serial.println("Alert cleared");
+  }
   return true;
 }
 
@@ -207,18 +356,48 @@ void drawDegree(int x, int y) {
 }
 
 // Top-line text: cycles through the city name and the next three days,
-// e.g. "Tue 93/74 Rain". The condition is dropped if it won't fit before the Wi-Fi bars.
+// e.g. "Tue 93/74 Sunny". The condition is dropped if it won't fit before the Wi-Fi bars.
 void drawHeaderText() {
   const char* text = CITY_NAME;
-  char buf[24];
+  char buf[28];
   uint32_t slot = (millis() / 1000 / HEADER_SLOT_SECS) % 4;
   if (forecastValid && slot > 0) {
     const ForecastDay& d = forecast[slot - 1];
-    snprintf(buf, sizeof(buf), "%s %d/%d %s", d.name, d.high, d.low, describeCode(d.code));
+    snprintf(buf, sizeof(buf), "%s %d/%d %s", d.name, d.high, d.low, d.cond);
     if (u8g2.getStrWidth(buf) > 96) snprintf(buf, sizeof(buf), "%s %d/%d", d.name, d.high, d.low);
     text = buf;
   }
   u8g2.drawStr(0, 8, text);
+}
+
+// Scrolls text leftward if it's wider than the box; otherwise just draws it.
+void drawMarquee(int y, const char* text, int boxW) {
+  int textW = u8g2.getStrWidth(text);
+  if (textW <= boxW) {
+    u8g2.drawStr(0, y, text);
+    return;
+  }
+  const int gap = 20;
+  int totalW = textW + gap;
+  int offset = (millis() / 40) % totalW;
+  int x = -offset;
+  u8g2.drawStr(x, y, text);
+  if (x + totalW < boxW) u8g2.drawStr(x + totalW, y, text);
+}
+
+// Replaces the header with a blinking, inverted banner naming the most
+// urgent active alert (e.g. "!! SEVERE THUNDERSTORM WARNING"), scrolling it
+// if it's too wide to fit.
+void drawAlertBanner() {
+  bool flash = (millis() / 500) % 2 == 0;
+  u8g2.setClipWindow(0, 0, 127, 11);
+  u8g2.drawBox(0, 0, 128, 11);
+  u8g2.setDrawColor(0);  // black on the white banner
+  char banner[40];
+  snprintf(banner, sizeof(banner), "%s %s", flash ? "!!" : "  ", alert.event);
+  drawMarquee(9, banner, 128);
+  u8g2.setDrawColor(1);
+  u8g2.setMaxClipWindow();
 }
 
 // Small 12-hour clock, right-aligned under the condition text.
@@ -241,11 +420,15 @@ void drawWeather() {
   char buf[32];
   u8g2.clearBuffer();
 
-  // Header
+  // Header: normally rotates city/forecast, but a severe alert takes over.
   u8g2.setFont(u8g2_font_6x10_tr);
-  drawHeaderText();
-  drawWiFiBars();
-  if (lastFetchFailed) u8g2.drawStr(122, 8, "!");  // last refresh failed, showing old data
+  if (alert.active) {
+    drawAlertBanner();
+  } else {
+    drawHeaderText();
+    drawWiFiBars();
+    if (lastFetchFailed) u8g2.drawStr(122, 8, "!");  // last refresh failed, showing old data
+  }
   u8g2.drawHLine(0, 11, 128);
 
   // Big temperature
@@ -258,7 +441,7 @@ void drawWeather() {
 
   // Condition, right of the temperature
   u8g2.setFont(u8g2_font_6x10_tr);
-  const char* cond = describeCode(weather.code);
+  const char* cond = weather.condition;
   int cw = u8g2.getStrWidth(cond);
   u8g2.drawStr(max(0, 128 - cw), 24, cond);
 
@@ -267,8 +450,7 @@ void drawWeather() {
            (int)roundf(weather.feelsLike), weather.humidity);
   u8g2.drawStr(0, 52, buf);
   snprintf(buf, sizeof(buf), "H%d L%d  Wind %dmph",
-           (int)roundf(weather.high), (int)roundf(weather.low),
-           (int)roundf(weather.wind));
+           weather.high, weather.low, (int)roundf(weather.wind));
   u8g2.drawStr(0, 63, buf);
 
   drawClock();
@@ -295,17 +477,31 @@ void setup() {
   configTzTime(TIMEZONE, "pool.ntp.org", "time.nist.gov");  // start the clock sync
 
   showMessage("Getting weather...");
-  lastFetchFailed = !fetchWeather();
+  bool condOk = fetchConditions();
+  bool fcOk   = fetchForecast();
+  lastFetchFailed = !(condOk && fcOk);
   lastFetch = millis();
+
+  lastAlertFetchFailed = !fetchAlerts();
+  lastAlertFetch = millis();
 }
 
 void loop() {
   // Retry sooner (1 min) after a failure, otherwise use the normal interval.
-  uint32_t interval = lastFetchFailed ? 60UL * 1000UL : REFRESH_MS;
-
+  uint32_t interval = lastFetchFailed ? 60UL * 1000UL : WEATHER_REFRESH_MS;
   if (millis() - lastFetch >= interval) {
-    lastFetchFailed = !fetchWeather();
+    bool condOk = fetchConditions();
+    bool fcOk   = fetchForecast();
+    lastFetchFailed = !(condOk && fcOk);
     lastFetch = millis();
+  }
+
+  // Alerts are checked more often, and retried sooner (30s) after a failure,
+  // since severe weather can develop quickly.
+  uint32_t alertInterval = lastAlertFetchFailed ? 30UL * 1000UL : ALERT_REFRESH_MS;
+  if (millis() - lastAlertFetch >= alertInterval) {
+    lastAlertFetchFailed = !fetchAlerts();
+    lastAlertFetch = millis();
   }
 
   if (weather.valid) {
@@ -313,5 +509,6 @@ void loop() {
   } else {
     showMessage("No weather yet", "Retrying in 1 min");
   }
-  delay(1000);
+  // Redraw faster while an alert is active so the flash/scroll look smooth.
+  delay(alert.active ? 200 : 1000);
 }

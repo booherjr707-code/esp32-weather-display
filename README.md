@@ -1,15 +1,20 @@
 # ESP32 Weather Display
 
 A small weather station for an ESP32 and a 128x64 I2C OLED. It gets the weather for
-Jonesboro, AR from [Open-Meteo](https://open-meteo.com/) (free, no API key) and shows:
+Jonesboro, AR from the [National Weather Service](https://www.weather.gov/documentation/services-web-api)
+(`api.weather.gov`, free, no API key) and shows:
 
-- current temperature, conditions, feels-like, humidity and wind
-- today's high and low
-- a top line that rotates between the city name and the next 3 days' forecast
+- current temperature, conditions, feels-like, humidity and wind (from the nearest NWS
+  observation station)
+- today's high and low, and a top line that rotates between the city name and the next
+  3 days' forecast
 - a small 12-hour clock (US Central time, syncs over the internet)
 - a 4-bar Wi-Fi signal indicator
 
-It refreshes every 10 minutes.
+Conditions and the forecast refresh every 10 minutes. Active **NWS severe weather
+alerts** (watches, warnings, advisories) are checked every 2 minutes; when one is
+active, it takes over the top line as a flashing, scrolling banner (e.g. "!! SEVERE
+THUNDERSTORM WARNING") until it clears.
 
 ## Hardware
 
@@ -30,7 +35,9 @@ It refreshes every 10 minutes.
    password. `secrets.h` is git-ignored so your password is never uploaded. The ESP32
    only works on 2.4 GHz Wi-Fi.
 3. Change the city, latitude and longitude near the top of `src/main.cpp` if you are
-   not in Jonesboro.
+   not in Jonesboro. If you do, also look up your new `NWS_GRID_ID`/`NWS_GRID_X`/
+   `NWS_GRID_Y`/`NWS_STATION` from `https://api.weather.gov/points/{lat},{lon}` and
+   its `observationStations` link, and update those constants too.
 4. Plug in the ESP32 with a USB cable that carries data, then run
    `pio run -t upload -t monitor`.
 

@@ -26,5 +26,10 @@
 ## Ideas for later
 - (Done) 3-day outlook: the top line rotates through the city and the next 3 days
 - (Done) Clock: small 12-hour NTP clock, US Central time
+- (Done) Switched weather source from Open-Meteo to the National Weather Service, and
+  added severe weather alerts (flashing banner) — 2026-09-22
+- Real lightning proximity (not just "a severe t-storm warning is active"): would need
+  an AS3935 lightning detector sensor (~$8-10, I2C) wired in alongside the OLED. James
+  doesn't have one yet.
 - Button to cycle between screens
 - Add `pio` to your shell PATH
